@@ -123,6 +123,24 @@ pub struct Parser<'schema, 'record> {
     cache: Mutex<CachedSlices<'schema, 'record>>,
 }
 
+impl<'schema, 'record> std::fmt::Display for Parser<'schema, 'record> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Parser properties:")?;
+        for property in self.properties {
+            let type_info = match &property.info {
+                PropertyInfo::Value { in_type, out_type, .. } => {
+                    format!("{:?} -> {:?}", in_type, out_type)
+                }
+                PropertyInfo::Array { in_type, out_type, .. } => {
+                    format!("Array[{:?} -> {:?}]", in_type, out_type)
+                }
+            };
+            writeln!(f, "  {}: {}", property.name, type_info)?;
+        }
+        Ok(())
+    }
+}
+
 impl<'schema, 'record> Parser<'schema, 'record> {
     /// Use the `create` function to create an instance of a Parser
     ///
