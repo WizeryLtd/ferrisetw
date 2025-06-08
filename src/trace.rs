@@ -198,6 +198,10 @@ pub struct UserTrace {
     // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
     // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
     callback_data: Box<Arc<CallbackData>>,
+    // Track whether we created this session (true) or connected to existing (false)
+    owns_session: bool,
+    // Track whether we've already stopped to prevent double-closing
+    stopped: bool,
 }
 
 /// A real-time trace session to collect events from kernel-mode drivers
@@ -213,6 +217,10 @@ pub struct KernelTrace {
     // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
     // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
     callback_data: Box<Arc<CallbackData>>,
+    // Track whether we created this session (true) or connected to existing (false)
+    owns_session: bool,
+    // Track whether we've already stopped to prevent double-closing
+    stopped: bool,
 }
 
 /// A trace session that reads events from an ETL file
@@ -319,6 +327,7 @@ mod private {
             control_handle: ControlHandle,
             trace_handle: TraceHandle,
             callback_data: Box<Arc<CallbackData>>,
+            owns_session: bool,
         ) -> Self;
         fn augmented_file_mode() -> u32;
         fn enable_flags(_providers: &[Provider]) -> u32;
@@ -339,12 +348,15 @@ impl private::PrivateRealTimeTraceTrait for UserTrace {
         control_handle: ControlHandle,
         trace_handle: TraceHandle,
         callback_data: Box<Arc<CallbackData>>,
+        owns_session: bool,
     ) -> Self {
         UserTrace {
             properties,
             control_handle,
             trace_handle,
             callback_data,
+            owns_session,
+            stopped: false,
         }
     }
 
@@ -358,12 +370,22 @@ impl private::PrivateRealTimeTraceTrait for UserTrace {
 
 impl private::PrivateTraceTrait for UserTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
+        // Prevent double-stopping
+        if self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
+        
         close_trace(self.trace_handle, &self.callback_data)?;
-        control_trace(
-            &mut self.properties,
-            self.control_handle,
-            Etw::EVENT_TRACE_CONTROL_STOP,
-        )?;
+        
+        // Only stop the session if we own it (created it ourselves)
+        if self.owns_session {
+            control_trace(
+                &mut self.properties,
+                self.control_handle,
+                Etw::EVENT_TRACE_CONTROL_STOP,
+            )?;
+        }
         Ok(())
     }
 }
@@ -376,12 +398,15 @@ impl private::PrivateRealTimeTraceTrait for KernelTrace {
         control_handle: ControlHandle,
         trace_handle: TraceHandle,
         callback_data: Box<Arc<CallbackData>>,
+        owns_session: bool,
     ) -> Self {
         KernelTrace {
             properties,
             control_handle,
             trace_handle,
             callback_data,
+            owns_session,
+            stopped: false,
         }
     }
 
@@ -400,12 +425,22 @@ impl private::PrivateRealTimeTraceTrait for KernelTrace {
 
 impl private::PrivateTraceTrait for KernelTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
+        // Prevent double-stopping
+        if self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
+        
         close_trace(self.trace_handle, &self.callback_data)?;
-        control_trace(
-            &mut self.properties,
-            self.control_handle,
-            Etw::EVENT_TRACE_CONTROL_STOP,
-        )?;
+        
+        // Only stop the session if we own it (created it ourselves)
+        if self.owns_session {
+            control_trace(
+                &mut self.properties,
+                self.control_handle,
+                Etw::EVENT_TRACE_CONTROL_STOP,
+            )?;
+        }
         Ok(())
     }
 }
@@ -532,9 +567,85 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
         )?;
 
         Ok((
-            T::build(full_properties, control_handle, trace_handle, callback_data),
+            T::build(full_properties, control_handle, trace_handle, callback_data, true), // true = we created this session
             trace_handle,
         ))
+    }
+
+    /// Connect to an existing trace session by name
+    ///
+    /// This method allows connecting to an ETW trace session that already exists,
+    /// similar to how krabsetw handles existing sessions.
+    ///
+    /// Internally, this calls `ControlTraceW` with `EVENT_TRACE_CONTROL_QUERY` to verify 
+    /// the session exists, then uses `OpenTraceW` to connect to it.
+    ///
+    /// # Notes
+    /// * The session must already exist, or this will return an error
+    /// * You can enable providers on the existing session after connecting
+    /// * See the documentation of [`TraceBuilder::start`] for information about processing events
+    pub fn open_existing(mut self, session_name: String) -> TraceResult<(T, TraceHandle)> {
+        // Override the name to connect to the existing session
+        self.name = session_name;
+        
+        // Prepare a wide version of the trace name
+        let trace_wide_name = U16CString::from_str_truncate(&self.name);
+        let mut trace_wide_vec = trace_wide_name.into_vec();
+        trace_wide_vec.truncate(crate::native::etw_types::TRACE_NAME_MAX_CHARS);
+        let trace_wide_name = U16CString::from_vec_truncate(trace_wide_vec);
+
+        // Try to open the existing session
+        let (full_properties, control_handle) = crate::native::evntrace::open_existing_trace::<T>(
+            &trace_wide_name,
+            &self.properties,
+        )?;
+
+        // Enable providers if this is a user trace
+        if T::TRACE_KIND == private::TraceKind::User {
+            for prov in self.rt_callback_data.providers() {
+                // For existing sessions, only ignore "Access denied" errors
+                // Other errors indicate real problems and should fail
+                match enable_provider(control_handle, prov) {
+                    Ok(()) => {},
+                    Err(crate::native::EvntraceNativeError::IoError(io_err)) => {
+                        // Compare against the HRESULT version of ERROR_ACCESS_DENIED
+                        let access_denied_hresult = windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult().0;
+                        if io_err.raw_os_error() == Some(access_denied_hresult) {
+                            // Access denied is expected for system-owned sessions, continue
+                        } else {
+                            return Err(crate::native::EvntraceNativeError::IoError(io_err).into());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        let callback_data = Box::new(Arc::new(CallbackData::RealTime(self.rt_callback_data)));
+        let trace_handle = open_trace(
+            SubscriptionSource::RealTimeSession(trace_wide_name),
+            &callback_data,
+        )?;
+
+        Ok((
+            T::build(full_properties, control_handle, trace_handle, callback_data, false), // false = we connected to existing session
+            trace_handle,
+        ))
+    }
+
+    /// Convenience method that calls [`TraceBuilder::open_existing`] then `process`
+    ///
+    /// # Notes
+    /// * See the documentation of [`TraceBuilder::open_existing`] for more info
+    /// * `process` is called on a spawned thread, and thus this method does not give any way to retrieve the error of `process` (if any)
+    pub fn open_existing_and_process(self, session_name: String) -> TraceResult<T> {
+        let (trace, trace_handle) = self.open_existing(session_name)?;
+
+        std::thread::spawn(move || UserTrace::process_from_handle(trace_handle));
+
+        Ok(trace)
     }
 
     /// Convenience method that calls [`TraceBuilder::start`] then `process`

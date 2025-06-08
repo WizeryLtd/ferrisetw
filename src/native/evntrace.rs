@@ -195,6 +195,54 @@ where
     }
 }
 
+/// Connect to an existing session.
+///
+/// This queries an existing session by name and returns the EventTraceProperties and a special ControlHandle 
+/// that represents name-based control for the existing session.
+pub(crate) fn open_existing_trace<T>(
+    trace_name: &U16CStr,
+    trace_properties: &TraceProperties,
+) -> EvntraceNativeResult<(EventTraceProperties, ControlHandle)>
+where
+    T: RealTimeTraceTrait,
+{
+    // Query the existing session to get its current properties
+    let mut properties = EventTraceProperties::new::<T>(
+        trace_name,
+        None, // When opening existing session, we don't specify ETL file
+        trace_properties,
+        Etw::EVENT_TRACE_FLAG::default(),
+    );
+
+    // Use ControlTraceW with EVENT_TRACE_CONTROL_QUERY to verify session exists and get its info
+    let status = unsafe {
+        Etw::ControlTraceW(
+            ControlHandle::default(), // Handle 0 means we're using session name
+            PCWSTR::from_raw(trace_name.as_ptr()),
+            properties.as_mut_ptr(),
+            Etw::EVENT_TRACE_CONTROL_QUERY,
+        )
+    }
+    .ok();
+
+    if let Err(status) = status {
+        let code = status.code();
+        return Err(EvntraceNativeError::IoError(
+            std::io::Error::from_raw_os_error(code.0),
+        ));
+    }
+
+    // Extract the actual control handle from the queried properties
+    // After a successful query, the Wnode.HistoricalContext field contains the session handle
+    let control_handle = unsafe {
+        let event_trace_props_ptr = &mut properties as *mut EventTraceProperties as *mut Etw::EVENT_TRACE_PROPERTIES;
+        let historical_context = (*event_trace_props_ptr).Wnode.Anonymous1.HistoricalContext;
+        ControlHandle { Value: historical_context }
+    };
+
+    Ok((properties, control_handle))
+}
+
 /// Subscribe to a started trace
 ///
 /// Microsoft calls this "opening" the trace (and this calls `OpenTraceW`)
@@ -303,6 +351,7 @@ pub(crate) fn control_trace(
     control_handle: ControlHandle,
     control_code: Etw::EVENT_TRACE_CONTROL,
 ) -> EvntraceNativeResult<()> {
+    // Use normal handle-based control for all sessions (including existing ones)
     match filter_invalid_control_handle(control_handle) {
         None => Err(EvntraceNativeError::InvalidHandle),
         Some(handle) => {
