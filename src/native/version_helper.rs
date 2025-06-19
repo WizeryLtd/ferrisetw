@@ -13,20 +13,11 @@ use windows::Win32::System::SystemInformation::{
     OSVERSIONINFOEXA, VER_MAJORVERSION, VER_MINORVERSION, VER_SERVICEPACKMAJOR,
 };
 
-/// Version Helper native error
-#[derive(Debug)]
-pub enum VersionHelperError {
-    /// Represents an standard IO Error
-    IoError(std::io::Error),
-}
-
-pub(crate) type VersionHelperResult<T> = Result<T, VersionHelperError>;
-
 type OsVersionInfo = OSVERSIONINFOEXA;
 // Safe cast, we now the value fits in a u8 (VER_GREATER_EQUAL == 3)
 const VER_GREATER_OR_EQUAL: u8 = windows::Win32::System::SystemServices::VER_GREATER_EQUAL as u8;
 
-fn verify_system_version(major: u8, minor: u8, sp_major: u16) -> VersionHelperResult<bool> {
+fn verify_system_version(major: u8, minor: u8, sp_major: u16) -> Result<bool, std::io::Error> {
     let mut os_version = OsVersionInfo {
         dwOSVersionInfoSize: std::mem::size_of::<OsVersionInfo>() as u32,
         dwMajorVersion: major as u32,
@@ -56,9 +47,7 @@ fn verify_system_version(major: u8, minor: u8, sp_major: u16) -> VersionHelperRe
         Ok(_) => Ok(true),
         Err(e) => match e.code() {
             e if e == HRESULT::from_win32(ERROR_OLD_WIN_VERSION.0) => Ok(false),
-            _ => Err(VersionHelperError::IoError(
-                std::io::Error::from_raw_os_error(unsafe { GetLastError() }.0 as i32),
-            )),
+            _ => Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() }.0 as i32)),
         },
     }
 }
