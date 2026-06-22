@@ -34,7 +34,7 @@ impl FileTime {
     fn as_quad(&self) -> i64 {
         let mut quad = self.0.dwHighDateTime as i64;
         quad <<= 32;
-        quad |= self.0.dwHighDateTime as i64;
+        quad |= self.0.dwLowDateTime as i64;
         quad
     }
 
@@ -152,5 +152,60 @@ impl serde::ser::Serialize for SystemTime {
         S: serde::Serializer,
     {
         self.as_unix_timestamp().serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_time(high: u32, low: u32) -> FileTime {
+        FileTime(FILETIME {
+            dwHighDateTime: high,
+            dwLowDateTime: low,
+        })
+    }
+
+    #[test]
+    fn as_quad_combines_high_and_low_dwords() {
+        // The 64-bit FILETIME is (dwHighDateTime << 32) | dwLowDateTime.
+        // Regression guard: the old code OR-ed dwHighDateTime in twice, which
+        // for these inputs would yield 0x1234_5678_1234_5678 and silently drop
+        // the low dword (i.e. all sub-second precision).
+        let ft = file_time(0x1234_5678, 0x9ABC_DEF0);
+        assert_eq!(ft.as_quad(), 0x1234_5678_9ABC_DEF0_i64);
+    }
+
+    #[test]
+    fn low_dword_carries_sub_second_precision() {
+        // Two FILETIMEs that differ only in the low dword must produce
+        // timestamps that differ by exactly that amount. Under the old bug the
+        // low dword was ignored, so this difference would be 0.
+        let base = file_time(0x01D5_0000, 0);
+        let plus_half_second = file_time(0x01D5_0000, 5_000_000); // 5,000,000 * 100ns = 0.5s
+        assert_eq!(
+            plus_half_second.as_unix_timestamp_nanos() - base.as_unix_timestamp_nanos(),
+            500_000_000,
+        );
+    }
+
+    #[cfg(any(feature = "time_rs", feature = "serde"))]
+    #[test]
+    fn from_quad_as_quad_round_trip() {
+        let quad = 0x01D5_1234_ABCD_4321_i64;
+        assert_eq!(FileTime::from_quad(quad).as_quad(), quad);
+    }
+
+    #[test]
+    fn as_unix_timestamp_matches_known_value() {
+        // 2021-01-01T00:00:00Z == unix 1_609_459_200 s.
+        // FILETIME quad = (unix_secs + SECONDS_BETWEEN_1601_AND_1970) * 10_000_000.
+        let quad = (1_609_459_200 + SECONDS_BETWEEN_1601_AND_1970) * 10_000_000;
+        let ft = file_time((quad >> 32) as u32, (quad & 0xffff_ffff) as u32);
+        assert_eq!(ft.as_unix_timestamp(), 1_609_459_200 * MS_IN_SECOND);
+        assert_eq!(
+            ft.as_unix_timestamp_nanos(),
+            1_609_459_200_i128 * NS_IN_SECOND as i128
+        );
     }
 }
