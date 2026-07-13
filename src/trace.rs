@@ -759,6 +759,53 @@ pub fn stop_trace_by_name(trace_name: &str) -> TraceResult<()> {
     Ok(())
 }
 
+/// Runtime statistics of a trace session, as reported by ETW on
+/// `EVENT_TRACE_CONTROL_QUERY`. All counters are cumulative since the session
+/// started. The loss counters (`events_lost`, `real_time_buffers_lost`) are the
+/// primary signal that the consumer cannot keep up and events are being dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceStats {
+    /// Events the kernel discarded because no free buffer was available — the
+    /// headline data-loss counter.
+    pub events_lost: u32,
+    /// Buffers that could not be delivered to the real-time consumer in time.
+    pub real_time_buffers_lost: u32,
+    /// Buffers lost while flushing to a log file (0 for pure real-time sessions).
+    pub log_buffers_lost: u32,
+    /// Buffers successfully written — useful as context/denominator.
+    pub buffers_written: u32,
+    /// Buffers currently allocated to the session.
+    pub number_of_buffers: u32,
+    /// Buffers currently free.
+    pub free_buffers: u32,
+}
+
+/// Query the runtime [`TraceStats`] of a running session by name.
+///
+/// Calls `ControlTraceW` with `EVENT_TRACE_CONTROL_QUERY`, which fills in the
+/// session's cumulative counters (events/buffers lost, etc.). This is the
+/// counterpart to [`stop_trace_by_name`]: it lets a consumer monitor a
+/// real-time session for dropped events without owning the [`UserTrace`] handle.
+pub fn query_trace_stats_by_name(trace_name: &str) -> TraceResult<TraceStats> {
+    let trace_properties = TraceProperties::default();
+    let flags = Etw::EVENT_TRACE_FLAG::default();
+    let wide_name = U16CString::from_str(trace_name).map_err(|_| TraceError::InvalidTraceName)?;
+
+    // As with EVENT_TRACE_CONTROL_STOP, the input contents barely matter — ETW
+    // overwrites the counter fields on QUERY — so new::<UserTrace>() is fine even
+    // for a kernel session.
+    let mut properties = EventTraceProperties::new::<UserTrace>(
+        &wide_name,
+        None,
+        &trace_properties,
+        flags,
+    );
+
+    control_trace_by_name(&mut properties, &wide_name, Etw::EVENT_TRACE_CONTROL_QUERY)?;
+
+    Ok(properties.stats())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

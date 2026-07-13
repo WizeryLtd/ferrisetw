@@ -307,6 +307,21 @@ impl EventTraceProperties {
             .map(|ws| ws.to_os_string())
             .unwrap_or_else(|_| OsString::from("<invalid name>"))
     }
+
+    /// Snapshot of the session's runtime counters, as ETW fills them in on a
+    /// `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` call. Only meaningful after
+    /// such a query — on a freshly built (never-queried) instance these are 0.
+    pub(crate) fn stats(&self) -> crate::trace::TraceStats {
+        let p = &self.etw_trace_properties;
+        crate::trace::TraceStats {
+            events_lost: p.EventsLost,
+            real_time_buffers_lost: p.RealTimeBuffersLost,
+            log_buffers_lost: p.LogBuffersLost,
+            buffers_written: p.BuffersWritten,
+            number_of_buffers: p.NumberOfBuffers,
+            free_buffers: p.FreeBuffers,
+        }
+    }
 }
 
 /// Newtype wrapper over an [EVENT_TRACE_LOGFILEW]
