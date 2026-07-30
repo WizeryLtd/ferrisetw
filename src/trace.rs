@@ -759,10 +759,11 @@ pub fn stop_trace_by_name(trace_name: &str) -> TraceResult<()> {
     Ok(())
 }
 
-/// Runtime statistics of a trace session, as reported by ETW on
-/// `EVENT_TRACE_CONTROL_QUERY`. All counters are cumulative since the session
-/// started. The loss counters (`events_lost`, `real_time_buffers_lost`) are the
-/// primary signal that the consumer cannot keep up and events are being dropped.
+/// Runtime statistics and buffer configuration of a trace session, as reported
+/// by ETW on `EVENT_TRACE_CONTROL_QUERY`. The counters are cumulative since the
+/// session started. The loss counters (`events_lost`, `real_time_buffers_lost`)
+/// are the primary signal that the consumer cannot keep up and events are being
+/// dropped; the buffer fields echo the session's effective configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TraceStats {
     /// Events the kernel discarded because no free buffer was available — the
@@ -778,6 +779,12 @@ pub struct TraceStats {
     pub number_of_buffers: u32,
     /// Buffers currently free.
     pub free_buffers: u32,
+    /// The session's buffer size in KB, as configured at start.
+    pub buffer_size_kb: u32,
+    /// The session's minimum buffer count, as configured at start.
+    pub minimum_buffers: u32,
+    /// The session's maximum buffer count, as configured at start.
+    pub maximum_buffers: u32,
 }
 
 /// Query the runtime [`TraceStats`] of a running session by name.

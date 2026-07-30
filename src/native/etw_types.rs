@@ -320,6 +320,9 @@ impl EventTraceProperties {
             buffers_written: p.BuffersWritten,
             number_of_buffers: p.NumberOfBuffers,
             free_buffers: p.FreeBuffers,
+            buffer_size_kb: p.BufferSize,
+            minimum_buffers: p.MinimumBuffers,
+            maximum_buffers: p.MaximumBuffers,
         }
     }
 }
