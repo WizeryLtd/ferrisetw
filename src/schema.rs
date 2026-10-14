@@ -15,6 +15,10 @@ use once_cell::sync::OnceCell;
 pub struct Schema {
     te_info: TraceEventInfo,
     cached_properties: OnceCell<Result<Vec<Property>, PropertyError>>,
+    /// [`Self::static_offsets`] for events with 4-byte pointers.
+    static_offsets_32: OnceCell<Vec<Option<usize>>>,
+    /// [`Self::static_offsets`] for events with 8-byte pointers.
+    static_offsets_64: OnceCell<Vec<Option<usize>>>,
 }
 
 impl Schema {
@@ -22,7 +26,36 @@ impl Schema {
         Schema {
             te_info,
             cached_properties: OnceCell::new(),
+            static_offsets_32: OnceCell::new(),
+            static_offsets_64: OnceCell::new(),
         }
+    }
+
+    /// The byte offset of each property in the user buffer of an event with
+    /// `pointer_size`-byte pointers, for the properties whose offset does not
+    /// depend on the event's content: every property before them has a size
+    /// the schema fixes. `None` for a property that follows one of variable
+    /// size (a null-terminated string, a length or count read from another
+    /// property). Computed once per pointer size.
+    pub(crate) fn static_offsets(&self, pointer_size: usize) -> &[Option<usize>] {
+        let cell = if pointer_size == 4 {
+            &self.static_offsets_32
+        } else {
+            &self.static_offsets_64
+        };
+        cell.get_or_init(|| {
+            let properties = self.properties();
+            let mut offsets = Vec::with_capacity(properties.len());
+            let mut next = Some(0usize);
+            for property in properties {
+                offsets.push(next);
+                next = match (next, property.static_size(pointer_size)) {
+                    (Some(offset), Some(size)) => offset.checked_add(size),
+                    _ => None,
+                };
+            }
+            offsets
+        })
     }
 
     /// Use the `decoding_source` function to obtain the [DecodingSource] from the `TRACE_EVENT_INFO`

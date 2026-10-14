@@ -2,13 +2,10 @@
 //!
 //! This module makes sure the calls are safe memory-wise, but does not attempt to ensure they are called in the right order.<br/>
 //! Thus, you should prefer using `UserTrace`s, `KernelTrace`s and `TraceBuilder`s, that will ensure these API are correctly used.
-use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::Mutex;
-
-use once_cell::sync::Lazy;
+use std::sync::RwLock;
 
 use widestring::U16CStr;
 use windows::core::GUID;
@@ -59,30 +56,37 @@ pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
 ///       callback so that we know when to actually free memory used by the (now useless) callback.
 ///       Maybe also setting the BufferCallback in EVENT_TRACE_LOGFILEW may help us.
 ///       That's <https://github.com/n4r1b/ferrisetw/issues/62>
+///
+/// The set is checked on every event, by every trace's processing thread, and changes only
+/// when a trace opens or closes. It holds one entry per open trace, so it is a short list
+/// scanned under a shared lock: the processing threads check it concurrently, without
+/// hashing.
 static UNIQUE_VALID_CONTEXTS: UniqueValidContexts = UniqueValidContexts::new();
-struct UniqueValidContexts(Lazy<Mutex<HashSet<u64>>>);
+struct UniqueValidContexts(RwLock<Vec<u64>>);
 enum ContextError {
     AlreadyExist,
 }
 
 impl UniqueValidContexts {
     pub const fn new() -> Self {
-        Self(Lazy::new(|| Mutex::new(HashSet::new())))
+        Self(RwLock::new(Vec::new()))
     }
     /// Insert if it did not exist previously
     fn insert(&self, ctx_ptr: *const c_void) -> Result<(), ContextError> {
-        match self.0.lock().unwrap().insert(ctx_ptr as u64) {
-            true => Ok(()),
-            false => Err(ContextError::AlreadyExist),
+        let mut contexts = self.0.write().unwrap();
+        if contexts.contains(&(ctx_ptr as u64)) {
+            return Err(ContextError::AlreadyExist);
         }
+        contexts.push(ctx_ptr as u64);
+        Ok(())
     }
 
     fn remove(&self, ctx_ptr: *const c_void) {
-        self.0.lock().unwrap().remove(&(ctx_ptr as u64));
+        self.0.write().unwrap().retain(|ctx| *ctx != ctx_ptr as u64);
     }
 
     pub fn is_valid(&self, ctx_ptr: *const c_void) -> bool {
-        self.0.lock().unwrap().contains(&(ctx_ptr as u64))
+        self.0.read().unwrap().contains(&(ctx_ptr as u64))
     }
 }
 

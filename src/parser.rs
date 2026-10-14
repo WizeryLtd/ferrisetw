@@ -11,7 +11,6 @@ use crate::native::tdh_types::{
 use crate::native::time::{FileTime, SystemTime};
 use crate::property::PropertySlice;
 use crate::schema::Schema;
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
@@ -84,9 +83,12 @@ type ParserResult<T> = Result<T, ParserError>;
 #[derive(Default)]
 /// Cache of the properties we've extracted already
 ///
-/// This is useful because computing their offset can be costly
+/// This is useful because computing their offset can be costly. Only the
+/// properties after one of variable size go through it: the others are
+/// located from the schema's static offsets.
 struct CachedSlices<'schema, 'record> {
-    slices: HashMap<String, PropertySlice<'schema, 'record>>,
+    /// The slices of the first `slices.len()` properties, in schema order.
+    slices: Vec<PropertySlice<'schema, 'record>>,
     /// The user buffer index we've cached up to
     last_cached_offset: usize,
 }
@@ -119,6 +121,9 @@ struct CachedSlices<'schema, 'record> {
 #[allow(dead_code)]
 pub struct Parser<'schema, 'record> {
     properties: &'schema [Property],
+    /// The schema's static offset of each property for this record's pointer
+    /// size (see [`Schema::static_offsets`]).
+    static_offsets: &'schema [Option<usize>],
     record: &'record EventRecord,
     cache: Mutex<CachedSlices<'schema, 'record>>,
 }
@@ -161,6 +166,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
         Parser {
             record: event_record,
             properties: schema.properties(),
+            static_offsets: schema.static_offsets(event_record.pointer_size()),
             cache: Mutex::new(CachedSlices::default()),
         }
     }
@@ -273,57 +279,66 @@ impl<'schema, 'record> Parser<'schema, 'record> {
         }
     }
 
+    /// The slice of `property`, which starts at `offset` in the user buffer.
+    fn slice_at(
+        &self,
+        property: &'schema Property,
+        offset: usize,
+    ) -> ParserResult<PropertySlice<'schema, 'record>> {
+        let remaining_user_buffer = match self.record.user_buffer().get(offset..) {
+            None => {
+                return Err(ParserError::PropertyError(
+                    "Invalid buffer bounds".to_owned(),
+                ))
+            }
+            Some(s) => s,
+        };
+
+        let prop_size = self.find_property_size(property, remaining_user_buffer)?;
+        let property_buffer = match remaining_user_buffer.get(..prop_size) {
+            None => {
+                return Err(ParserError::PropertyError(
+                    "Property length out of buffer bounds".to_owned(),
+                ))
+            }
+            Some(s) => s,
+        };
+
+        Ok(PropertySlice {
+            property,
+            buffer: property_buffer,
+        })
+    }
+
     fn find_property(&self, name: &str) -> ParserResult<PropertySlice<'schema, 'record>> {
+        // The first property of that name, as the sequential walk finds it.
+        let index = match self.properties.iter().position(|p| p.name == name) {
+            Some(index) => index,
+            None => return Err(ParserError::NotFound),
+        };
+        let property = &self.properties[index];
+
+        // A property preceded only by properties of schema-fixed size starts
+        // at a known offset: no walk over the earlier properties is needed.
+        if let Some(Some(offset)) = self.static_offsets.get(index) {
+            return self.slice_at(property, *offset);
+        }
+
         let mut cache = self.cache.lock().unwrap();
 
         // We may have extracted this property already
-        if let Some(p) = cache.slices.get(name) {
+        if let Some(p) = cache.slices.get(index) {
             return Ok(*p);
         }
 
-        let last_cached_property = cache.slices.len();
-        let properties_not_parsed_yet = match self.properties.get(last_cached_property..) {
-            Some(s) => s,
-            // If we've parsed every property already, that means no property matches this name
-            None => return Err(ParserError::NotFound),
-        };
-
-        for property in properties_not_parsed_yet {
-            let remaining_user_buffer =
-                match self.record.user_buffer().get(cache.last_cached_offset..) {
-                    None => {
-                        return Err(ParserError::PropertyError(
-                            "Invalid buffer bounds".to_owned(),
-                        ))
-                    }
-                    Some(s) => s,
-                };
-
-            let prop_size = self.find_property_size(property, remaining_user_buffer)?;
-            let property_buffer = match remaining_user_buffer.get(..prop_size) {
-                None => {
-                    return Err(ParserError::PropertyError(
-                        "Property length out of buffer bounds".to_owned(),
-                    ))
-                }
-                Some(s) => s,
-            };
-
-            let prop_slice = PropertySlice {
-                property,
-                buffer: property_buffer,
-            };
-            cache
-                .slices
-                .insert(String::clone(&property.name), prop_slice);
-            cache.last_cached_offset += prop_size;
-
-            if property.name == name {
-                return Ok(prop_slice);
-            }
+        while cache.slices.len() <= index {
+            let next = &self.properties[cache.slices.len()];
+            let prop_slice = self.slice_at(next, cache.last_cached_offset)?;
+            cache.last_cached_offset += prop_slice.buffer.len();
+            cache.slices.push(prop_slice);
         }
 
-        Err(ParserError::NotFound)
+        Ok(cache.slices[index])
     }
 
     /// Return a property from the event, or an error in case the parsing failed.
@@ -447,6 +462,36 @@ impl_try_parse_primitive_array!(i32);
 impl_try_parse_primitive_array!(u64);
 impl_try_parse_primitive_array!(i64);
 
+/// Decodes a UTF-16 string from `buffer`, which holds its code units in native byte order
+/// and has an even length. One trailing null terminator is dropped. The buffer is not
+/// aligned for u16 access, so code units are read from byte pairs. The leading ASCII run
+/// (all of a typical path) is copied byte by byte; the rest is decoded as UTF-16, an
+/// unpaired surrogate becoming U+FFFD.
+fn decode_wide(buffer: &[u8]) -> String {
+    let mut units = buffer.len() / 2;
+    // remove the null terminator
+    if units > 0 && buffer[2 * units - 2] == 0 && buffer[2 * units - 1] == 0 {
+        units -= 1;
+    }
+    let mut wide = buffer[..2 * units]
+        .chunks_exact(2)
+        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .peekable();
+
+    let mut ascii = Vec::with_capacity(units);
+    while let Some(unit) = wide.next_if(|unit| *unit < 0x80) {
+        ascii.push(unit as u8);
+    }
+    let mut decoded = match String::from_utf8(ascii) {
+        Ok(decoded) => decoded,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    };
+    for c in std::char::decode_utf16(wide) {
+        decoded.push(c.unwrap_or(std::char::REPLACEMENT_CHARACTER));
+    }
+    decoded
+}
+
 /// The `String` impl of the `TryParse` trait should be used to retrieve the following [TdhInTypes]:
 ///
 /// * InTypeUnicodeString
@@ -485,27 +530,7 @@ impl private::TryParse<String> for Parser<'_, '_> {
                         ));
                     }
 
-                    // std::slice::from_raw_parts requires a pointer to be aligned, but we can't
-                    // guarantee that the buffer is aligned. In testing, I found that the buffer
-                    // is in fact never aligned appropriately, so a cheap workaround is to copy
-                    // the buffer into a new Vec<u16> and use that as the source for the slice
-                    // until we can find a better solution.
-                    let mut aligned_buffer = Vec::with_capacity(prop_slice.buffer.len() / 2);
-                    for chunk in prop_slice.buffer.chunks_exact(2) {
-                        let part = u16::from_ne_bytes([chunk[0], chunk[1]]);
-                        aligned_buffer.push(part);
-                    }
-
-                    let mut wide = aligned_buffer.as_slice();
-
-                    match wide.last() {
-                        // remove the null terminator from the slice
-                        Some(c) if c == &0 => wide = &wide[..wide.len() - 1],
-                        _ => (),
-                    }
-
-                    // Decode UTF-16 to String
-                    Ok(widestring::decode_utf16_lossy(wide.iter().copied()).collect::<String>())
+                    Ok(decode_wide(prop_slice.buffer))
                 }
                 TdhInType::InTypeAnsiString => {
                     let string = std::str::from_utf8(prop_slice.buffer)?;
@@ -701,3 +726,40 @@ impl private::TryParse<Vec<u8>> for Parser<'_, '_> {
 
 // TODO: Implement SocketAddress
 // TODO: Study if we can use primitive types for HexInt64, HexInt32 and Pointer
+
+#[cfg(test)]
+mod tests {
+    use super::decode_wide;
+
+    fn wide(units: &[u16]) -> Vec<u8> {
+        units.iter().flat_map(|unit| unit.to_ne_bytes()).collect()
+    }
+
+    fn terminated(text: &str) -> Vec<u8> {
+        let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        wide(&units)
+    }
+
+    #[test]
+    fn ascii_and_non_ascii_strings_decode_and_drop_the_terminator() {
+        for text in [
+            "",
+            r"\Device\HarddiskVolume3\Users\data\report.docx",
+            "C:\\Users\\\u{05e9}\u{05dc}\u{05d5}\u{05dd}\\\u{1f600}.txt",
+            "\u{00e9}t\u{00e9}",
+        ] {
+            assert_eq!(decode_wide(&terminated(text)), text);
+        }
+    }
+
+    #[test]
+    fn an_unterminated_string_keeps_its_last_unit() {
+        assert_eq!(decode_wide(&wide(&[0x61, 0x62])), "ab");
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_becomes_the_replacement_character() {
+        assert_eq!(decode_wide(&wide(&[0x61, 0xD800, 0x62, 0])), "a\u{fffd}b");
+        assert_eq!(decode_wide(&wide(&[0xDC00, 0])), "\u{fffd}");
+    }
+}

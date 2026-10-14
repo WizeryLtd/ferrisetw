@@ -161,6 +161,51 @@ impl Property {
             }
         }
     }
+
+    /// The size in bytes of this property in an event with
+    /// `pointer_size`-byte pointers, when the schema alone fixes it: a
+    /// pointer, a value or element of a set length, an array of a set count.
+    /// `None` when the size depends on the event's content (a
+    /// null-terminated string, a length or count held by another property,
+    /// a length TDH computes). These are exactly the cases in which the
+    /// parser sizes a property without reading the event.
+    pub(crate) fn static_size(&self, pointer_size: usize) -> Option<usize> {
+        match self.info {
+            PropertyInfo::Value {
+                in_type, length, ..
+            } => {
+                if in_type == TdhInType::InTypePointer {
+                    return Some(pointer_size);
+                }
+                match length {
+                    PropertyLength::Length(l) if l > 0 => Some(usize::from(l)),
+                    _ => None,
+                }
+            }
+            PropertyInfo::Array {
+                in_type,
+                length,
+                count,
+                ..
+            } => {
+                let element = if in_type == TdhInType::InTypePointer {
+                    pointer_size
+                } else {
+                    match length {
+                        PropertyLength::Length(l) => usize::from(l),
+                        PropertyLength::Index(_) => return None,
+                    }
+                };
+                let PropertyCount::Count(count) = count else {
+                    return None;
+                };
+                if element == 0 {
+                    return None;
+                }
+                element.checked_mul(usize::from(count))
+            }
+        }
+    }
 }
 
 /// Represent a TDH_IN_TYPE
@@ -256,5 +301,96 @@ impl From<Etw::PROPERTY_FLAGS> for PropertyFlags {
         let flags: i32 = val.0;
         // Should be a safe cast
         PropertyFlags::from_bits_truncate(flags as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(in_type: TdhInType, length: PropertyLength) -> Property {
+        Property {
+            name: String::new(),
+            info: PropertyInfo::Value {
+                in_type,
+                out_type: TdhOutType::OutTypeNull,
+                length,
+            },
+        }
+    }
+
+    fn array(in_type: TdhInType, length: PropertyLength, count: PropertyCount) -> Property {
+        Property {
+            name: String::new(),
+            info: PropertyInfo::Array {
+                in_type,
+                out_type: TdhOutType::OutTypeNull,
+                length,
+                count,
+            },
+        }
+    }
+
+    #[test]
+    fn a_pointer_takes_the_record_pointer_size() {
+        let pointer = value(TdhInType::InTypePointer, PropertyLength::Length(0));
+        assert_eq!(pointer.static_size(8), Some(8));
+        assert_eq!(pointer.static_size(4), Some(4));
+    }
+
+    #[test]
+    fn a_set_length_is_static_and_a_content_length_is_not() {
+        assert_eq!(
+            value(TdhInType::InTypeUInt32, PropertyLength::Length(4)).static_size(8),
+            Some(4)
+        );
+        assert_eq!(
+            value(TdhInType::InTypeUnicodeString, PropertyLength::Length(0)).static_size(8),
+            None
+        );
+        assert_eq!(
+            value(TdhInType::InTypeBinary, PropertyLength::Index(2)).static_size(8),
+            None
+        );
+    }
+
+    #[test]
+    fn an_array_of_a_set_count_is_static() {
+        assert_eq!(
+            array(
+                TdhInType::InTypeUInt16,
+                PropertyLength::Length(2),
+                PropertyCount::Count(3)
+            )
+            .static_size(8),
+            Some(6)
+        );
+        assert_eq!(
+            array(
+                TdhInType::InTypePointer,
+                PropertyLength::Length(0),
+                PropertyCount::Count(2)
+            )
+            .static_size(4),
+            Some(8)
+        );
+        assert_eq!(
+            array(
+                TdhInType::InTypeUInt16,
+                PropertyLength::Length(2),
+                PropertyCount::Index(1)
+            )
+            .static_size(8),
+            None
+        );
+        assert_eq!(
+            array(
+                TdhInType::InTypeUInt16,
+                PropertyLength::Length(0),
+                PropertyCount::Count(3)
+            )
+            .static_size(8),
+            None
+        );
     }
 }
